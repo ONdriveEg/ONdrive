@@ -12,38 +12,34 @@ export default function App(){
   const [rides,setRides]=useState([])
   const [from,setFrom]=useState('كفر الشيخ')
   const [to,setTo]=useState('القاهرة')
-  const [price,setPrice]=useState(325)
-  const [activeRide,setActiveRide]=useState(null)
-  const [driverProfile,setDriverProfile]=useState(JSON.parse(localStorage.getItem('driverProfile')||'{}'))
   const [sending,setSending]=useState(false)
   const [verifying,setVerifying]=useState(false)
-
-  const saveDriver = (k,v)=>{
-    const n={...driverProfile,[k]:v}; setDriverProfile(n); localStorage.setItem('driverProfile',JSON.stringify(n))
-  }
 
   useEffect(()=>{
     const savedPhone = localStorage.getItem('phone')
     if(savedPhone){
-      setPhone(savedPhone); setUser({id: 'fb-'+savedPhone, phone: savedPhone})
+      setPhone(savedPhone);
+      setUser({phone: savedPhone})
     }
   },[])
 
   useEffect(()=>{
-    if(user) loadRides()
-  },[user])
+    loadRides()
+    // Realtime
+    const channel = supabase.channel('rides-changes')
+    .on('postgres_changes', {event:'*', schema:'public', table:'rides'}, ()=> loadRides())
+    .subscribe()
+    return ()=> supabase.removeChannel(channel)
+  },[])
 
-  // ده الحل للـ reCAPTCHA
   const setupRecaptcha = ()=>{
     if(typeof window === 'undefined') return
-    // امسح القديم لو موجود
     if(window.recaptchaVerifier){
       try{ window.recaptchaVerifier.clear() }catch(e){}
       window.recaptchaVerifier = null
     }
     window.recaptchaVerifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
-      'size':'invisible',
-      'callback': (response) => {}
+      'size':'invisible'
     });
   }
 
@@ -53,10 +49,14 @@ export default function App(){
     try{
       setupRecaptcha()
       let fullPhone = phone.trim()
-      if(fullPhone.startsWith('0')){
-        fullPhone = '+20'+fullPhone.slice(1)
-      } else if(!fullPhone.startsWith('+')){
-        fullPhone = '+20'+fullPhone
+      if(fullPhone.startsWith('0')) fullPhone = '+20'+fullPhone.slice(1)
+      
+      // --- للتجربة: لو الرقم ده استخدم كود 123456 ---
+      if(phone === '01030110276'){
+         localStorage.setItem('phone', phone)
+         setUser({phone: phone})
+         setSending(false)
+         return
       }
 
       const confirmation = await signInWithPhoneNumber(auth, fullPhone, window.recaptchaVerifier)
@@ -64,44 +64,65 @@ export default function App(){
       setStep('otp')
     }catch(err){
       alert('خطأ: '+err.message);
-      if(window.recaptchaVerifier){
-        try{ window.recaptchaVerifier.clear() }catch(e){}
-        window.recaptchaVerifier = null
-      }
-      console.log(err)
-    }finally{
-      setSending(false)
-    }
+      if(window.recaptchaVerifier){ try{window.recaptchaVerifier.clear()}catch(e){}; window.recaptchaVerifier=null }
+    }finally{ setSending(false) }
   }
 
   const verifyCode = async()=>{
     if(otp.length < 4) return alert('اكتب الكود')
+    // كود التجربة
+    if(phone === '01030110276' && otp === '123456'){
+      localStorage.setItem('phone', phone)
+      setUser({phone: phone})
+      return
+    }
     setVerifying(true)
     try{
       const result = await window.confirmationResult.confirm(otp);
       localStorage.setItem('phone', phone)
-      setUser({id: result.user.uid, phone: phone})
-      const email = phone+'@ondrive.eg';
-      const pass = 'OnDrive_'+phone+'_2024!'
-      await supabase.auth.signUp({ email, password: pass }).catch(()=>{})
-      await supabase.auth.signInWithPassword({email, password: pass}).catch(()=>{})
-    }catch(err){
-      alert('كود خطأ: '+err.message)
-    }finally{
-      setVerifying(false)
-    }
+      setUser({phone: phone})
+    }catch(err){ alert('كود خطأ: '+err.message) }
+    finally{ setVerifying(false) }
   }
 
   const loadRides=async()=>{
-    const {data}=await supabase.from('rides').select('*').order('created_at',{ascending:false})
-    if(data){
-      setRides(data); if(data[0]) setActiveRide(data[0])
-    }
+    const {data} = await supabase.from('rides').select('*').order('created_at',{ascending:false}).limit(20)
+    if(data) setRides(data)
   }
 
   const requestRide=async()=>{
-    const {data}=await supabase.from('rides').insert({ client_id: user.id, from_text:from, to_text:to, price:price, status:'يبحث عن كابتن', driver_name: driverProfile.driverName }).select().single()
-    if(data){ loadRides() }
+    if(!from || !to) return alert('اكتب من و الى')
+    const {data, error} = await supabase.from('rides').insert([{
+      from_text: from,
+      to_text: to,
+      price: 325,
+      category: 'اقتصادي',
+      payment_method: 'XPay',
+      status: 'بحث عن كابتن',
+      client_phone: phone
+    }]).select().single()
+    
+    if(error){
+      alert('ايرور: '+error.message)
+      console.log(error)
+    } else {
+      alert('تم ارسال الطلب ✅')
+      loadRides()
+    }
+  }
+
+  const acceptRide = async (id)=>{
+    const {error} = await supabase.from('rides').update({
+      status: 'وصل الكابتن',
+      driver_name: 'كابتن - ' + phone
+    }).eq('id', id)
+    if(error) alert(error.message)
+    else loadRides()
+  }
+
+  const rejectRide = async (id)=>{
+    await supabase.from('rides').update({ status: 'ملغي' }).eq('id', id)
+    loadRides()
   }
 
   if(!user) return (
@@ -111,18 +132,13 @@ export default function App(){
         <p>ادخل رقم تليفونك</p>
         <input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="01xxxxxxxxx" style={{width:'100%',padding:12,fontSize:18,textAlign:'center',borderRadius:10,border:'1px solid #ccc'}}/>
         <br/><br/>
-        <button onClick={sendCode} disabled={sending} style={{width:'100%',padding:15,background: sending?'#666':'black',color:'white',fontSize:18,borderRadius:10,border:'none',transition:'0.3s'}}>
-          {sending? '⏳ جاري الارسال...' : 'ارسال كود SMS 📲'}
-        </button>
+        <button onClick={sendCode} disabled={sending} style={{width:'100%',padding:15,background: sending?'#666':'black',color:'white',fontSize:18,borderRadius:10,border:'none'}}> {sending? '⏳ جاري الارسال...' : 'ارسال كود SMS 📲'} </button>
+        <p style={{fontSize:12,color:'#888',marginTop:10}}>للتجربة: 01030110276 / كود 123456</p>
       </> : <>
         <p>دخل كود الـ SMS اللي وصل على {phone}</p>
-        <input value={otp} onChange={e=>setOtp(e.target.value)} placeholder="******" style={{width:'100%',padding:12,fontSize:22,textAlign:'center',letterSpacing:5,borderRadius:10,border:'1px solid #ccc'}}/>
+        <input value={otp} onChange={e=>setOtp(e.target.value)} placeholder="123456" style={{width:'100%',padding:12,fontSize:22,textAlign:'center',letterSpacing:5,borderRadius:10,border:'1px solid #ccc'}}/>
         <br/><br/>
-        <button onClick={verifyCode} disabled={verifying} style={{width:'100%',padding:15,background: verifying?'#666':'black',color:'white',fontSize:18,borderRadius:10,border:'none'}}>
-          {verifying? '⏳ جاري التأكيد...' : 'تأكيد ودخول ✅'}
-        </button>
-        <br/><br/>
-        <button onClick={()=>{ setStep('phone'); if(window.recaptchaVerifier){ try{window.recaptchaVerifier.clear()}catch(e){}; window.recaptchaVerifier=null } }} style={{background:'transparent',border:'none',color:'#666',textDecoration:'underline'}}>تغيير الرقم</button>
+        <button onClick={verifyCode} disabled={verifying} style={{width:'100%',padding:15,background: verifying?'#666':'black',color:'white',fontSize:18,borderRadius:10,border:'none'}}> {verifying? '⏳ جاري التأكيد...' : 'تأكيد ودخول ✅'} </button>
       </>}
       <div id="recaptcha-container"></div>
     </div>
@@ -132,12 +148,35 @@ export default function App(){
     <div style={{padding:10,maxWidth:500,margin:'auto',fontFamily:'Arial'}}>
       <h2 style={{textAlign:'center'}}>ONdrive - {phone}</h2>
       <div style={{display:'flex',gap:5,justifyContent:'center'}}>
-        <button onClick={()=>{setRole('client');localStorage.setItem('role','client')}} style={{padding:8,borderRadius:8,background:role==='client'?'black':'white',color:role==='client'?'white':'black'}}>عميل</button>
-        <button onClick={()=>{setRole('driver');localStorage.setItem('role','driver')}} style={{padding:8,borderRadius:8,background:role==='driver'?'black':'white',color:role==='driver'?'white':'black'}}>كابتن</button>
-        <button onClick={()=>{localStorage.removeItem('phone'); setUser(null)}} style={{padding:8,borderRadius:8}}>خروج</button>
+        <button onClick={()=>{setRole('client');localStorage.setItem('role','client')}} style={{padding:10,borderRadius:8,background:role==='client'?'black':'white',color:role==='client'?'white':'black',border:'1px solid black'}}>عميل</button>
+        <button onClick={()=>{setRole('driver');localStorage.setItem('role','driver')}} style={{padding:10,borderRadius:8,background:role==='driver'?'black':'white',color:role==='driver'?'white':'black',border:'1px solid black'}}>كابتن</button>
+        <button onClick={()=>{localStorage.removeItem('phone'); setUser(null)}} style={{padding:10,borderRadius:8}}>خروج</button>
       </div>
-      {role==='client' && (<div style={{marginTop:15}}>من: <input value={from} onChange={e=>setFrom(e.target.value)} style={{width:'100%',padding:10,borderRadius:8}}/><br/><br/>إلى: <input value={to} onChange={e=>setTo(e.target.value)} style={{width:'100%',padding:10,borderRadius:8}}/><br/><br/><button onClick={requestRide} style={{width:'100%',padding:15,background:'black',color:'white',borderRadius:10}}>اطلب الآن</button></div>)}
-      {activeRide && (<div style={{marginTop:15,background:'#eee',padding:10,borderRadius:10}}><b>{activeRide.from_text} → {activeRide.to_text}</b></div>)}
+
+      {role==='client' && (
+        <div style={{marginTop:15,background:'#f9f9f9',padding:15,borderRadius:12}}>
+          <label>من:</label> <input value={from} onChange={e=>setFrom(e.target.value)} style={{width:'100%',padding:10,borderRadius:8,marginBottom:10}}/>
+          <label>إلى:</label> <input value={to} onChange={e=>setTo(e.target.value)} style={{width:'100%',padding:10,borderRadius:8}}/>
+          <br/><br/>
+          <button onClick={requestRide} style={{width:'100%',padding:15,background:'black',color:'white',borderRadius:10,fontSize:18}}>اطلب الآن 🚀</button>
+        </div>
+      )}
+
+      <div style={{marginTop:20}}>
+        <h3>{role==='driver' ? 'الطلبات المتاحة' : 'اخر طلباتك'}</h3>
+        {rides.filter(r=> role==='driver' ? r.status==='بحث عن كابتن' : true).map(r=>(
+          <div key={r.id} style={{background:'#eee',padding:12,borderRadius:10,marginBottom:10}}>
+            <b>{r.from_text} → {r.to_text}</b>
+            <div style={{fontSize:13,color:'#555'}}>{r.price} جنيه - {r.status} - {r.client_phone}</div>
+            {role==='driver' && r.status==='بحث عن كابتن' && (
+              <div style={{display:'flex',gap:8,marginTop:8}}>
+                <button onClick={()=>acceptRide(r.id)} style={{flex:1,padding:10,background:'#00c853',color:'white',border:'none',borderRadius:8}}>قبول ✅</button>
+                <button onClick={()=>rejectRide(r.id)} style={{flex:1,padding:10,background:'#d50000',color:'white',border:'none',borderRadius:8}}>رفض ❌</button>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
